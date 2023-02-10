@@ -77,62 +77,61 @@ def copy(dest, source):
 
 @cuda.jit
 def test(a, b):
-    for i in range(a.shape[0]):
-        copy(b[i], a[i])
+    i = cuda.grid(1)
+    print(i)
+    # for i in range(a.shape[0]):
+    #     copy(b[i], a[i])
         
 @cuda.jit
-def monte_carlo_sample_collision(state, obstacles, num_obstacles, std_dev, collision_probability, rng_states):
+def monte_carlo_sample_collision(state, obstacles, num_obstacles, std_dev, count, rng_states):
+    gidx = cuda.grid(1)
+    if gidx >= num_samples:
+        return
+    tidx = cuda.threadIdx.x
+    bidx = cuda.blockIdx.x
     sample_obstacle = cuda.local.array(shape=(4, 2), dtype=float32)
-    collisions = cuda.shared.array(shape=(num_samples), dtype=float32)
-    idx = cuda.grid(1)
-    collisions[idx] = 0
-    
-    dx = 0.
-    dy = 0.
-    dt = 0.
+    local_count = cuda.shared.array(shape=(threads_per_block), dtype=float32)
+    local_count[tidx] = 0.
     
     # generate world
     for i in range(num_obstacles):
-        dx = xoroshiro128p_normal_float32(rng_states, idx) * std_dev[i, 0]
-        dy = xoroshiro128p_normal_float32(rng_states, idx) * std_dev[i, 1]
-        dt = xoroshiro128p_normal_float32(rng_states, idx) * std_dev[i, 2]
+        dx = xoroshiro128p_normal_float32(rng_states, gidx) * std_dev[i, 0]
+        dy = xoroshiro128p_normal_float32(rng_states, gidx) * std_dev[i, 1]
+        dt = xoroshiro128p_normal_float32(rng_states, gidx) * std_dev[i, 2]
 
         rot_trans_rectangle(obstacles[i], sample_obstacle, dx, dy, dt)
         
         if convex_collide(state, sample_obstacle) == 1:
-            collisions[idx] = 1
+            local_count[tidx] = 1
 
     num_collisions = 0.
     cuda.syncthreads()
-    if idx == 0:
-        for i in range(num_samples):
-            num_collisions += collisions[i]
-        collision_probability[0] = num_collisions / num_samples
+    if tidx == 0:
+        for i in range(threads_per_block):
+            num_collisions += local_count[i]
+        count[bidx] = num_collisions
 
 
-collide = np.ones(1, dtype=np.int32)
-offset = np.array([[0.9, 1]])
-theta = np.pi / 3
-R = np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]], dtype=np.float32)
-
-r1 = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
-r2 = r1 @ R + offset
-
+num_samples = 10000
 threads_per_block = 1024
-blocks = 1
-
+blocks = (num_samples + (threads_per_block - 1)) // threads_per_block
+print(blocks, threads_per_block)
 rng_states = create_xoroshiro128p_states(threads_per_block*blocks, seed=1)
 
-a = np.ones((2,5), dtype=np.int32)
-b = np.zeros((2,5), dtype=np.int32)
+# a = np.ones((2,5), dtype=np.int32)
+# b = np.zeros((2,5), dtype=np.int32)
+
+# test[2,1024](a,b)
+# print(b)
 
 state = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.float32)
 obstacles = np.array([[[0, 0], [1, 0], [1, 1], [0, 1]]], dtype=np.float32)
 num_obstacles = len(obstacles)
 std_dev = np.array([[np.sqrt(0.3), np.sqrt(0.5), np.sqrt(1)]], dtype=np.float32)
-num_samples = threads_per_block
-collision_probability = np.zeros(1, dtype=np.float32)
+collision_count = np.zeros(blocks, dtype=np.float32)
 
-monte_carlo_sample_collision[(1),(threads_per_block)](state, obstacles, num_obstacles, std_dev, collision_probability, rng_states)
-cuda.synchronize()
+monte_carlo_sample_collision[blocks,1024](state, obstacles, num_obstacles, std_dev, collision_count, rng_states)
+collisions = np.sum(collision_count)
+print(collision_count)
+collision_probability = collisions / num_samples
 print(collision_probability)
