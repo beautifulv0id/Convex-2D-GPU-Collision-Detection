@@ -162,8 +162,14 @@ __global__ void compute_normals(float* cp, float* normals){
 
     float norm = sqrtf(nx*nx+ny*ny);
 
-    normals[2*index] = nx;
-    normals[2*index+1] = ny;
+    normals[2*index] = 0;
+    normals[2*index+1] = 0;
+
+    if(norm >= 1e-5)
+    {
+        normals[2*index] = nx/norm;
+        normals[2*index+1] = ny/norm;
+    }
 }
 
 void create_rect(float* r, float w, float h)
