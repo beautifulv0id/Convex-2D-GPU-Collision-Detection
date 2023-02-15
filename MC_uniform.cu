@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string>
 #include <iostream> 
+#include <fstream>
 #include <cmath>
 #include <math.h>
 #include <random>
@@ -16,28 +17,35 @@
 #include <thrust/device_vector.h>
 #include <curand_kernel.h>
 #include <curand.h>
- 
-#define N 100000
 
-#define R_WIDTH 4.07
-#define R_HEIGHT 1.74
+ /*
+ This file creates a dataset of collision probabilities between a robot and an obstacle modeled as rectangles for different configurations using Monte Carlo sampling.
+ One data-point defines the width, height and variance of the obstacle, as well as the position and orientation of the robot w.r.t the obstacle coordinate frame.
+ First, NUM_POSES poses and NUM_VARIANCES variances are unifomely sampled from user-defined bounds. A pose contains the width and height of the obstacle and angle 
+ theta of the robot. Variances are defined for the position and orientation of the obstacle. Finally, for each data-point a robot position is uniformly sampled, 
+ as well as a random pose and variance from the pregenerated poses and variances. 
+ */
 
-#define BORDER 6.0
-#define NUM_BATCH 33554432
-#define NUM_BATCHES 100
+#define N 10000 // numer of monte carlo smaples
 
-#define NUM_POSES 64*64*64
-#define NUM_VARIANCES 64*64*64
+#define R_WIDTH 4.07 // width of the robot
+#define R_HEIGHT 1.74 // height of the robot
 
-#define POS_MIN -6.0
-#define POS_MAX 6.0
+#define NUM_BATCH 33554432 // number of configurations that are generated per batch
+#define NUM_BATCHES 10 // number of batches 
+#define NUM_DATA_POINTS NUM_BATCH*NUM_BATCHES
 
-#define OBSTACLE_MIN 0.1
-#define OBSTACLE_MAX 5.0
+#define NUM_POSES 64*64 // number of poses that are sampled, a pose contains the width, height of the obstacle and angle theta of the robot
+#define NUM_VARIANCES 64*64 // number of variances that are sampled, 
 
-#define VAR_MIN 0.001
-#define VAR_MAX 1.0
+#define POS_MIN -6.0 // minimium x-, y-position of the robot
+#define POS_MAX 6.0 // maximum x-, y-position of the robot
 
+#define OBSTACLE_MIN 1.0 // minimum width, height of obstacles
+#define OBSTACLE_MAX 5.0 // maximum width, height of obstacles
+
+#define VAR_MIN 0.001 // minimum positional and rotational variance 
+#define VAR_MAX 0.3 // maximum positional and rotational variance 
 
 #define THREADS 1024
 #define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
@@ -45,6 +53,28 @@
 #define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
     printf("Error at %s:%d\n",__FILE__,__LINE__); \
     return EXIT_FAILURE;}} while(0)
+
+
+void write_config(){
+    std::ofstream confFile;
+    confFile.open ("data/config.txt", std::ios::out);
+    confFile << "N" << "\t" << N << "\n";
+    confFile << "R_WIDTH" << "\t" << R_WIDTH << "\n";
+    confFile << "R_HEIGHT" << "\t" << R_HEIGHT << "\n";
+    confFile << "NUM_BATCH" << "\t" << NUM_BATCH << "\n";
+    confFile << "NUM_BATCHES" << "\t" << NUM_BATCHES << "\n";
+    confFile << "NUM_DATA_POINTS" << "\t" << NUM_DATA_POINTS << "\n";
+    confFile << "NUM_POSES" << "\t" << NUM_POSES << "\n";
+    confFile << "NUM_VARIANCES" << "\t" << NUM_VARIANCES << "\n";
+    confFile << "POS_MIN" << "\t" << POS_MIN << "\n";
+    confFile << "POS_MAX" << "\t" << POS_MAX << "\n";
+    confFile << "OBSTACLE_MIN" << "\t" << OBSTACLE_MIN << "\n";
+    confFile << "OBSTACLE_MAX" << "\t" << OBSTACLE_MAX << "\n";
+    confFile << "VAR_MIN" << "\t" << VAR_MIN << "\n";
+    confFile << "VAR_MAX" << "\t" << VAR_MAX << "\n";
+    confFile.close();
+
+}
 
 __global__ void setup_kernel(curandState *state)
 {
@@ -124,8 +154,8 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base, 
     if(idx >= NUM_BATCH)
         return;
     
-    float x = curand_normal(state) * BORDER;
-    float y = curand_normal(state) * BORDER;
+    float x = curand_uniform(state) * POS_MIN;
+    float y = curand_uniform(state) * POS_MAX;
 
     int pose_idx = curand(state) % NUM_POSES;
     float w = poses[(pose_idx)*3];
@@ -195,15 +225,7 @@ int main(){
 
     }
 
-    cudaStream_t stream[nDevices];
-    for (int i = 0; i < nDevices; i ++)
-    {
-        CUDA_CALL(cudaStreamCreate(&stream[i]));
-    }
-    for (int i = 0; i < nDevices; i ++)
-    {
-        CUDA_CALL(cudaStreamDestroy(stream[i]));
-    }
+    write_config();
 
     std::cout << "Allocate data..." << std::endl;
 
@@ -277,6 +299,9 @@ int main(){
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
     std::cout << "Total number of configurations: " << NUM_BATCH << std::endl;
     std::cout << "Begin computation..." << std::endl;
+    int counter = 0;
+    printf("batches generated: %i/%i", counter, NUM_BATCHES);
+    fflush(stdout); 
 
     for (int i = 0; i < NUM_BATCHES; i++)
     {
@@ -291,8 +316,10 @@ int main(){
             devStates
         );
         CUDA_CALL(cudaDeviceSynchronize());
+        printf("\33[2K\r");
+        printf("batches generated: %i/%i", ++counter, NUM_BATCHES);
+        fflush(stdout); 
 
-        std::cout << "Downloading data..." << std::endl;
         positions = d_positions;
         cp = d_cp;
         var_idxs = d_var_idxs;
