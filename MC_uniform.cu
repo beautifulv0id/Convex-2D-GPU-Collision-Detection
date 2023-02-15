@@ -23,7 +23,8 @@
 #define R_HEIGHT 1.74
 
 #define BORDER 6.0
-#define NUM_CONFIGS 16777216
+#define NUM_BATCH 33554432
+#define NUM_BATCHES 100
 
 #define NUM_POSES 64*64*64
 #define NUM_VARIANCES 64*64*64
@@ -39,7 +40,7 @@
 
 
 #define THREADS 1024
-#define BLOCKS (int) ceil(NUM_CONFIGS/(float) THREADS)
+#define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
 
 #define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
     printf("Error at %s:%d\n",__FILE__,__LINE__); \
@@ -120,7 +121,7 @@ __device__ int convex_collide(float* r1, float* r2) {
 
 __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base, float* poses, float* std_devs, float* pose_idxs, float* std_dev_idxs, float* positions, float* cp, curandState* state) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if(idx >= NUM_CONFIGS)
+    if(idx >= NUM_BATCH)
         return;
     
     float x = curand_normal(state) * BORDER;
@@ -231,28 +232,37 @@ int main(){
         std_devs[3*i+2] = sqrt(variances[3*i+2]);     
     }
 
+    // write poses and variances
+    size_t poses_shape[2] = {(size_t) NUM_POSES, (size_t) 3};
+    size_t variances_shape[2] = {(size_t) NUM_VARIANCES, (size_t) 3};
+    npy::SaveArrayAsNumpy("data/poses.npy", false, 2, poses_shape, thrust::raw_pointer_cast(poses.data()));
+    npy::SaveArrayAsNumpy("data/variances.npy", false, 2, variances_shape, variances);
+
+
     thrust::host_vector<float> robot(4*2);
-    thrust::host_vector<float> positions(NUM_CONFIGS*2);
-    thrust::host_vector<float> pose_idxs(NUM_CONFIGS);
-    thrust::host_vector<float> var_idxs(NUM_CONFIGS);
-    // thrust::host_vector<float> normals(NUM_CONFIGS*2);
-    thrust::host_vector<float> cp(NUM_CONFIGS);
+    thrust::host_vector<float> positions(NUM_BATCH*2);
+    thrust::host_vector<float> pose_idxs(NUM_BATCH);
+    thrust::host_vector<float> var_idxs(NUM_BATCH);
+    // thrust::host_vector<float> normals(NUM_BATCH*2);
+    thrust::host_vector<float> cp(NUM_BATCH);
     
     thrust::device_vector<float> d_robot(4*2);
     thrust::device_vector<float> d_poses(NUM_POSES*3);
     thrust::device_vector<float> d_std_devs(NUM_VARIANCES*3);
 
-    thrust::device_vector<float> d_positions(NUM_CONFIGS*2);
-    thrust::device_vector<float> d_pose_idxs(NUM_CONFIGS);
-    thrust::device_vector<float> d_var_idxs(NUM_CONFIGS);
-    // thrust::device_vector<float> d_normals(NUM_CONFIGS*2);
-    thrust::device_vector<float> d_cp(NUM_CONFIGS);
+    thrust::device_vector<float> d_positions(NUM_BATCH*2);
+    thrust::device_vector<float> d_pose_idxs(NUM_BATCH);
+    thrust::device_vector<float> d_var_idxs(NUM_BATCH);
+    // thrust::device_vector<float> d_normals(NUM_BATCH*2);
+    thrust::device_vector<float> d_cp(NUM_BATCH);
+
+    std::vector<float> dataset(NUM_BATCH*8);
 
     curandState *devStates;
-    cudaMalloc((void **)&devStates, NUM_CONFIGS *  sizeof(curandState));
+    cudaMalloc((void **)&devStates, NUM_BATCH *  sizeof(curandState));
 
     dim3 threadsPerBlock(1024);
-    dim3 numBlocks((int) ceil(NUM_CONFIGS/threadsPerBlock.x));  
+    dim3 numBlocks((int) ceil(NUM_BATCH/threadsPerBlock.x));  
 
     // Initialize array
     create_rect(robot.data(), R_WIDTH, R_HEIGHT);
@@ -265,66 +275,58 @@ int main(){
     d_std_devs = std_devs;
 
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-    std::cout << "Total number of configurations: " << NUM_CONFIGS << std::endl;
+    std::cout << "Total number of configurations: " << NUM_BATCH << std::endl;
     std::cout << "Begin computation..." << std::endl;
 
-    monte_carlo_sample_collision_dataset_uniform<<<BLOCKS, THREADS>>>(
-        thrust::raw_pointer_cast(d_robot.data()),
-        thrust::raw_pointer_cast(d_poses.data()),
-        thrust::raw_pointer_cast(d_std_devs.data()),
-        thrust::raw_pointer_cast(d_pose_idxs.data()),
-        thrust::raw_pointer_cast(d_var_idxs.data()),
-        thrust::raw_pointer_cast(d_positions.data()),
-        thrust::raw_pointer_cast(d_cp.data()),
-        devStates
-    );
-    CUDA_CALL(cudaDeviceSynchronize());
-    // compute_normals<<<numBlocks, threadsPerBlock>>>(thrust::raw_pointer_cast(d_cp.data()), 
-    //                         thrust::raw_pointer_cast(d_normals.data()) );
-    // CUDA_CALL(cudaPeekAtLastError());
+    for (int i = 0; i < NUM_BATCHES; i++)
+    {
+        monte_carlo_sample_collision_dataset_uniform<<<BLOCKS, THREADS>>>(
+            thrust::raw_pointer_cast(d_robot.data()),
+            thrust::raw_pointer_cast(d_poses.data()),
+            thrust::raw_pointer_cast(d_std_devs.data()),
+            thrust::raw_pointer_cast(d_pose_idxs.data()),
+            thrust::raw_pointer_cast(d_var_idxs.data()),
+            thrust::raw_pointer_cast(d_positions.data()),
+            thrust::raw_pointer_cast(d_cp.data()),
+            devStates
+        );
+        CUDA_CALL(cudaDeviceSynchronize());
 
+        std::cout << "Downloading data..." << std::endl;
+        positions = d_positions;
+        cp = d_cp;
+        var_idxs = d_var_idxs;
+        pose_idxs = d_pose_idxs;
+
+        // write data
+        float* d = dataset.data();
+        float* c = cp.data();
+        // float* n = normals.data();
+
+        for (int j = 0; j < NUM_BATCH; j++)
+        {
+            d[0] = positions[j*2];  // x
+            d[1] = positions[j*2+1];  // y
+            d[2] = 0.0; // dx
+            d[3] = 0.0; // dy
+            d[4] = *c;  // cp
+            d[5] = var_idxs[j]; // var_idx
+            d[6] = pose_idxs[j]; // pose_idx
+            d[7] = 1.0; // weight
+            // n+=2;
+            c+=1;
+            d+=8;
+        }
+
+        // write dataset
+        size_t ds_shape[2] = {(size_t) NUM_BATCH, (size_t) 8};
+
+        npy::SaveArrayAsNumpy("data/" + std::to_string(i) + ".npy", false, 2, ds_shape, dataset);
+    }
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
     std::cout << "Finished computation" << std::endl;
     std::cout << "Elapsed time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << " [ms]" << std::endl;
 
-
-    std::cout << "Downloading data..." << std::endl;
-    positions = d_positions;
-    cp = d_cp;
-    var_idxs = d_var_idxs;
-    pose_idxs = d_pose_idxs;
-
-    // allocate arrays for dataset
-    std::vector<float> dataset(NUM_CONFIGS*8);
-
-    // write data
-    float* d = dataset.data();
-    float* c = cp.data();
-    // float* n = normals.data();
-
-    for (int i = 0; i < NUM_CONFIGS; i++)
-    {
-        d[0] = positions[i*2];  // x
-        d[1] = positions[i*2+1];  // y
-        d[2] = 0.0; // dx
-        d[3] = 0.0; // dy
-        d[4] = *c;  // cp
-        d[5] = var_idxs[i]; // var_idx
-        d[6] = pose_idxs[i]; // pose_idx
-        d[7] = 1.0; // weight
-        // n+=2;
-        c+=1;
-        d+=8;
-    }
-
-    // write dataset
-    size_t ds_shape[2] = {(size_t) NUM_CONFIGS, (size_t) 8};
-    size_t poses_shape[2] = {(size_t) NUM_POSES, (size_t) 3};
-    size_t variances_shape[2] = {(size_t) NUM_VARIANCES, (size_t) 3};
-
-    npy::SaveArrayAsNumpy("data/0.npy", false, 2, ds_shape, dataset);
-    npy::SaveArrayAsNumpy("data/poses.npy", false, 2, poses_shape, thrust::raw_pointer_cast(poses.data()));
-    npy::SaveArrayAsNumpy("data/variances.npy", false, 2, variances_shape, variances);
     // free memory
     cudaFree(devStates);
     std::cout << "Done." << std::endl;
