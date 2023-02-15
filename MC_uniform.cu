@@ -31,7 +31,7 @@
 #define R_WIDTH 4.07 // width of the robot
 #define R_HEIGHT 1.74 // height of the robot
 
-#define NUM_BATCH 33554432 // number of configurations that are generated per batch
+#define NUM_BATCH 16777216 // number of configurations that are generated per batch
 #define NUM_BATCHES 10 // number of batches 
 #define NUM_DATA_POINTS NUM_BATCH*NUM_BATCHES
 
@@ -41,14 +41,16 @@
 #define POS_MIN -6.0 // minimium x-, y-position of the robot
 #define POS_MAX 6.0 // maximum x-, y-position of the robot
 
-#define OBSTACLE_MIN 1.0 // minimum width, height of obstacles
-#define OBSTACLE_MAX 5.0 // maximum width, height of obstacles
+#define OBSTACLE_WIDTH_MIN 2.0 // minimum width, height of obstacles
+#define OBSTACLE_WIDTH_MAX 5.0 // maximum width, height of obstacles
 
 #define VAR_MIN 0.001 // minimum positional and rotational variance 
 #define VAR_MAX 0.3 // maximum positional and rotational variance 
 
 #define THREADS 1024
 #define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
+
+#define DATA_DIR "data"
 
 #define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
     printf("Error at %s:%d\n",__FILE__,__LINE__); \
@@ -57,7 +59,7 @@
 
 void write_config(){
     std::ofstream confFile;
-    confFile.open ("data/config.txt", std::ios::out);
+    confFile.open (DATA_DIR + std::string("/config.txt"), std::ios::out);
     confFile << "N" << "\t" << N << "\n";
     confFile << "R_WIDTH" << "\t" << R_WIDTH << "\n";
     confFile << "R_HEIGHT" << "\t" << R_HEIGHT << "\n";
@@ -68,8 +70,8 @@ void write_config(){
     confFile << "NUM_VARIANCES" << "\t" << NUM_VARIANCES << "\n";
     confFile << "POS_MIN" << "\t" << POS_MIN << "\n";
     confFile << "POS_MAX" << "\t" << POS_MAX << "\n";
-    confFile << "OBSTACLE_MIN" << "\t" << OBSTACLE_MIN << "\n";
-    confFile << "OBSTACLE_MAX" << "\t" << OBSTACLE_MAX << "\n";
+    confFile << "OBSTACLE_WIDTH_MIN" << "\t" << OBSTACLE_WIDTH_MIN << "\n";
+    confFile << "OBSTACLE_WIDTH_MAX" << "\t" << OBSTACLE_WIDTH_MAX << "\n";
     confFile << "VAR_MIN" << "\t" << VAR_MIN << "\n";
     confFile << "VAR_MAX" << "\t" << VAR_MAX << "\n";
     confFile.close();
@@ -234,14 +236,16 @@ int main(){
     std::vector<float> variances(NUM_VARIANCES*3);  
 
     std::default_random_engine generator;
-    auto obstacle_uniform = std::uniform_real_distribution<float>(OBSTACLE_MIN, OBSTACLE_MAX);
+    auto obstacle_uniform = std::uniform_real_distribution<float>(OBSTACLE_WIDTH_MIN, OBSTACLE_WIDTH_MAX);
+    auto obstacle_scale_uniform = std::uniform_real_distribution<float>(0.25, 0.75);
     auto theta_uniform = std::uniform_real_distribution<float>(0.0, 2.0*M_PI);
     auto variance_uniform = std::uniform_real_distribution<float>(VAR_MIN, VAR_MAX);
     
     for (int i = 0; i < NUM_POSES; i++)
     {
-        poses[3*i] = obstacle_uniform(generator);
-        poses[3*i+1] = obstacle_uniform(generator);
+        float width = obstacle_uniform(generator);
+        poses[3*i] = width;
+        poses[3*i+1] = width*obstacle_scale_uniform(generator);
         poses[3*i+2] = theta_uniform(generator);
     }    
     for (int i = 0; i < NUM_VARIANCES; i++)
@@ -251,14 +255,22 @@ int main(){
         variances[3*i+2] = variance_uniform(generator);       
         std_devs[3*i+0] = sqrt(variances[3*i+0]);
         std_devs[3*i+1] = sqrt(variances[3*i+1]);
-        std_devs[3*i+2] = sqrt(variances[3*i+2]);     
+        std_devs[3*i+2] = sqrt(variances[3*i+2]);  
+        float var = variance_uniform(generator);
+        variances[3*i+0] = var;
+        variances[3*i+1] = var;
+        variances[3*i+2] = var;       
+        std_devs[3*i+0] = sqrt(var);
+        std_devs[3*i+1] = sqrt(var);
+        std_devs[3*i+2] = sqrt(var);     
+
     }
 
     // write poses and variances
     size_t poses_shape[2] = {(size_t) NUM_POSES, (size_t) 3};
     size_t variances_shape[2] = {(size_t) NUM_VARIANCES, (size_t) 3};
-    npy::SaveArrayAsNumpy("data/poses.npy", false, 2, poses_shape, thrust::raw_pointer_cast(poses.data()));
-    npy::SaveArrayAsNumpy("data/variances.npy", false, 2, variances_shape, variances);
+    npy::SaveArrayAsNumpy(DATA_DIR + std::string("/poses.npy"), false, 2, poses_shape, thrust::raw_pointer_cast(poses.data()));
+    npy::SaveArrayAsNumpy(DATA_DIR + std::string("/variances.npy"), false, 2, variances_shape, variances);
 
 
     thrust::host_vector<float> robot(4*2);
@@ -348,7 +360,7 @@ int main(){
         // write dataset
         size_t ds_shape[2] = {(size_t) NUM_BATCH, (size_t) 8};
 
-        npy::SaveArrayAsNumpy("data/" + std::to_string(i) + ".npy", false, 2, ds_shape, dataset);
+        npy::SaveArrayAsNumpy(DATA_DIR + std::string("/") + std::to_string(i) + ".npy", false, 2, ds_shape, dataset);
     }
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
     std::cout << "Finished computation" << std::endl;
