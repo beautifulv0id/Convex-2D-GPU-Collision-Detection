@@ -26,19 +26,17 @@
  as well as a random pose and variance from the pregenerated poses and variances. 
  */
 
-#define N 10000 // numer of monte carlo smaples per iteration
-#define MAX_RESAMPLE 10
+#define N 1000 // numer of monte carlo smaples per iteration
+#define MAX_RESAMPLE 100
 #define R_WIDTH 4.07 // width of the robot
 #define R_HEIGHT 1.74 // height of the robot
 
-// #define NUM_BATCH 16777216 // number of configurations that are generated per batch
-// #define NUM_BATCHES 100 // number of batches 
 #define NUM_BATCH 16777216 // number of configurations that are generated per batch
-#define NUM_BATCHES 10 // number of batches 
+#define NUM_BATCHES 100 // number of batches 
 #define NUM_DATA_POINTS double(NUM_BATCH)*NUM_BATCHES
 
-#define NUM_POSES 64*64 // number of poses that are sampled, a pose contains the width, height of the obstacle and angle theta of the robot
-#define NUM_VARIANCES 64*64 // number of variances that are sampled, 
+#define NUM_POSES 64*64*64 // number of poses that are sampled, a pose contains the width, height of the obstacle and angle theta of the robot
+#define NUM_VARIANCES 64*64*64 // number of variances that are sampled, 
 
 #define POS_MIN -6.0 // minimium x-, y-position of the robot
 #define POS_MAX 6.0 // maximum x-, y-position of the robot
@@ -186,7 +184,19 @@ float calcSlack(int nsamples, int nsamples_true){
 }
 
 
-__global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base, float* poses, float* std_devs, float* pose_idxs, float* std_dev_idxs, float* positions, float* cp, float* accuracy_bins, float* bin_slack, int* done, int iteration, int num_left, curandState* state) {
+__global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
+                                                                float* poses,
+                                                                float* std_devs,
+                                                                float* pose_idxs,
+                                                                float* std_dev_idxs,
+                                                                FloatPair* positions,
+                                                                float* cps,
+                                                                float* accuracy_bins,
+                                                                float* bin_slack,
+                                                                int* done,
+                                                                int iteration,
+                                                                int num_left,
+                                                                curandState* state) {
     int gidx = blockIdx.x * blockDim.x + threadIdx.x;
     if(gidx >= num_left)
         return;
@@ -195,18 +205,17 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base, 
 
     int pose_idx;
     int std_dev_idx;
-    float x, y;
-    int collisions = 0;
-
+    FloatPair pos;
+    int total_collisions = 0;
+    float cp_out;
     if(iteration == 0){
-        x = curand_normal(localState) * 4/1.96;
-        y = curand_normal(localState) * 4/1.96;
+        pos.x = curand_normal(localState) * 3.9/1.96;
+        pos.y = curand_normal(localState) * 3.9/1.96;
         pose_idx = curand(localState) % NUM_POSES;
         std_dev_idx = curand(localState) % NUM_VARIANCES;
     } else {
-        collisions = (int) cp[gidx];
-        x = positions[gidx*2];
-        y = positions[gidx*2+1];
+        total_collisions = (int) cps[gidx];
+        pos = positions[gidx];
         pose_idx = pose_idxs[gidx];
         std_dev_idx = std_dev_idxs[gidx];
     }
@@ -225,33 +234,57 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base, 
     float robot[8];
 
     memcpy(robot, robot_base, sizeof(float) * 8);
-    rot_trans_rectangle(robot, x, y, t);
+    rot_trans_rectangle(robot, pos.x, pos.y, t);
 
     for (int i = 0; i < N; i++)
     {
         sample_rectangle(obstacle, sampled_obstacle, (float*) &std_dev, localState);
-        collisions += convex_collide(robot, sampled_obstacle);
+        total_collisions += convex_collide(robot, sampled_obstacle);
     }
 
-    float slack = calcSlack(N, collisions);
+    float slack = calcSlack(N, total_collisions);
 
-    float p =  (float) collisions / (float) (N * iteration);
-    int s = 0;
-    for (int i = 0; i < 3; i++){
-        if(p >= accuracy_bins[i] && p < accuracy_bins[i+1] && slack < bin_slack[i]){
-            s = 1;
+    float p = (float) total_collisions / (float) (N * (iteration+1));
+    int d = 0;
+    if(iteration+1 == MAX_RESAMPLE){
+        d = 1;
+    }
+    else {
+        for (int i = 0; i < 3; i++){
+            if(p >= accuracy_bins[i] && p < accuracy_bins[i+1] && slack < bin_slack[i]){
+                d = 1;
+            }
         }
     }
 
-    done[gidx] = s;
-    cp[gidx] = p;
-    positions[gidx*2] = x;
-    positions[gidx*2+1] = y;
+    cp_out = total_collisions;
+    if(d){
+        cp_out = p;
+    }
+
+    done[gidx] = d;
+    cps[gidx] = cp_out;
+    positions[gidx] = pos;
     pose_idxs[gidx] = pose_idx;
     std_dev_idxs[gidx] = std_dev_idx;
 }
 
-
+void print_help(int* done, int* d_done, int* index, int* d_index){
+    cudaMemcpy(done, d_done, sizeof(int) * NUM_BATCH, cudaMemcpyDeviceToHost);
+    cudaMemcpy(index, d_index, sizeof(int) * NUM_BATCH, cudaMemcpyDeviceToHost);
+    printf("done:  ");
+    for (size_t i = 0; i < NUM_BATCH; i++)
+    {
+        printf("%2d ", done[i]);
+    }
+    printf("\n");
+    printf("index: ");
+    for (size_t i = 0; i < NUM_BATCH; i++)
+    {
+        printf("%2d ", index[i]);
+    }
+    printf("\n");
+}
 
 int main(){
     int nDevices;
@@ -259,7 +292,7 @@ int main(){
 
     printf("Number of devices: %d\n", nDevices);
 
-    for (int i = 0; i < nDevices; i++) {
+    for (int i = 0; i < 1; i++) {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, i);
         printf("Device Number: %d\n", i);
@@ -303,27 +336,18 @@ int main(){
     
     for (int i = 0; i < NUM_POSES; i++)
     {
-        float width = obstacle_uniform(generator);
-        poses[3*i] = width;
-        poses[3*i+1] = width*obstacle_scale_uniform(generator);
+        poses[3*i] = obstacle_uniform(generator);
+        poses[3*i+1] = obstacle_uniform(generator);
         poses[3*i+2] = theta_uniform(generator);
     }    
     for (int i = 0; i < NUM_VARIANCES; i++)
     {
-        // variances[3*i+0] = variance_uniform(generator);
-        // variances[3*i+1] = variance_uniform(generator);
-        // variances[3*i+2] = variance_uniform(generator);       
-        // std_devs[3*i+0] = sqrt(variances[3*i+0]);
-        // std_devs[3*i+1] = sqrt(variances[3*i+1]);
-        // std_devs[3*i+2] = sqrt(variances[3*i+2]);  
-        float var = variance_uniform(generator);
-        variances[3*i+0] = var;
-        variances[3*i+1] = var;
-        variances[3*i+2] = var;       
-        std_devs[3*i+0] = sqrt(var);
-        std_devs[3*i+1] = sqrt(var);
-        std_devs[3*i+2] = sqrt(var);     
-
+        variances[3*i+0] = variance_uniform(generator);
+        variances[3*i+1] = variance_uniform(generator);
+        variances[3*i+2] = variance_uniform(generator);       
+        std_devs[3*i+0] = sqrt(variances[3*i+0]);
+        std_devs[3*i+1] = sqrt(variances[3*i+1]);
+        std_devs[3*i+2] = sqrt(variances[3*i+2]);   
     }
 
     // write poses and variances
@@ -333,10 +357,10 @@ int main(){
     npy::SaveArrayAsNumpy(DATA_DIR + std::string("/variances.npy"), false, 2, variances_shape, variances);
 
     float accuracy_bins[4] = {0, 0.01, 0.1, 1.};
-    float bin_slack[4] = {0.0001, 0.005, 0.01};
+    float bin_slack[4] = {0.0001, 0.005, 0.01, 0};
 
     float* robot = (float*) malloc(sizeof(float)*4*2);
-    float* positions = (float*) malloc(sizeof(float) * NUM_BATCH*2);
+    FloatPair* positions = (FloatPair*) malloc(sizeof(FloatPair) * NUM_BATCH);
     float* pose_idxs = (float*) malloc(sizeof(float) * NUM_BATCH);
     float* var_idxs = (float*) malloc(sizeof(float) * NUM_BATCH);
     float* cp = (float*) malloc(sizeof(float) * NUM_BATCH);
@@ -346,24 +370,26 @@ int main(){
     float* d_robot; 
     float* d_poses; 
     float* d_std_devs; 
-    float* d_positions; 
+    FloatPair* d_positions; 
     float* d_pose_idxs; 
     float* d_var_idxs; 
     float* d_cp; 
     int* d_done; 
+
+
 
     cudaMalloc(&d_accuracy_bins, sizeof(float)*(4));
     cudaMalloc(&d_bin_slack, sizeof(float)*(4));
     cudaMalloc(&d_robot, sizeof(float)*(4*2));
     cudaMalloc(&d_poses, sizeof(float)*(NUM_POSES*3));
     cudaMalloc(&d_std_devs, sizeof(float)*(NUM_VARIANCES*3));
-    cudaMalloc(&d_positions, sizeof(float)*(NUM_BATCH*2));
+    cudaMalloc(&d_positions, sizeof(FloatPair)*NUM_BATCH);
     cudaMalloc(&d_pose_idxs, sizeof(float)*(NUM_BATCH));
     cudaMalloc(&d_var_idxs, sizeof(float)*(NUM_BATCH));
     cudaMalloc(&d_cp, sizeof(float)*(NUM_BATCH));
     cudaMalloc(&d_done, sizeof(int)*(NUM_BATCH));
 
-    DeviceZipIterator d_iter(thrust::make_tuple(thrust::device_pointer_cast((FloatPair*) d_positions), 
+    DeviceZipIterator d_iter(thrust::make_tuple(thrust::device_pointer_cast(d_positions), 
                                         thrust::device_pointer_cast(d_cp),
                                         thrust::device_pointer_cast(d_var_idxs),
                                         thrust::device_pointer_cast(d_pose_idxs)));
@@ -393,16 +419,15 @@ int main(){
     std::cout << "Total number of configurations: " << NUM_BATCH << std::endl;
     std::cout << "Begin computation..." << std::endl;
     int counter = 0;
-    printf("batches generated: %i/%i", counter, NUM_BATCHES);
-    fflush(stdout); 
+    printf("batches generated: %i/%i\n", counter, NUM_BATCHES);
 
-    for (int i = 0; i < NUM_BATCHES; i++)
+    for (int batch_index = 0; batch_index < NUM_BATCHES; batch_index++)
     {
         int num_left = NUM_BATCH;
         int batch_done = 0;
         int iteration = 0;
         while(num_left != 0 && iteration < MAX_RESAMPLE){
-            numBlocks = ((int) ceil(num_left/threadsPerBlock.x));  
+            numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
             monte_carlo_sample_collision_dataset_uniform<<<numBlocks, threadsPerBlock>>>(
                 d_robot,
                 d_poses,
@@ -427,9 +452,17 @@ int main(){
                 cudaMemcpy(var_idxs + num_left, d_var_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
                 cudaMemcpy(pose_idxs + num_left, d_pose_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
             }
-            printf("iteration %i, batch_done %i, left %i\n", iteration, batch_done, num_left);
             iteration++;
         }
+
+        if(num_left > 0){
+            printf("copying remaining %i over (0, %i)\n", num_left, num_left);
+            cudaMemcpy(positions, d_positions, sizeof(FloatPair) * num_left, cudaMemcpyDeviceToHost);
+            cudaMemcpy(cp, d_cp, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
+            cudaMemcpy(var_idxs, d_var_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
+            cudaMemcpy(pose_idxs, d_pose_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost); 
+        }
+
 
         CUDA_CALL(cudaDeviceSynchronize());
         printf("\33[2K\r");
@@ -439,12 +472,11 @@ int main(){
         // write data
         float* d = dataset.data();
         float* c = cp;
-        // float* n = normals.data();
 
         for (int j = 0; j < NUM_BATCH; j++)
         {
-            d[0] = positions[j*2];  // x
-            d[1] = positions[j*2+1];  // y
+            d[0] = positions[j].x;  // x
+            d[1] = positions[j].y;  // y
             d[2] = *c;  // cp
             d[3] = var_idxs[j]; // var_idx
             d[4] = pose_idxs[j]; // pose_idx
@@ -455,7 +487,7 @@ int main(){
         // write dataset
         size_t ds_shape[2] = {(size_t) NUM_BATCH, (size_t) 5};
 
-        npy::SaveArrayAsNumpy(DATA_DIR + std::string("/") + std::to_string(i) + ".npy", false, 2, ds_shape, dataset);
+        npy::SaveArrayAsNumpy(DATA_DIR + std::string("/") + std::to_string(batch_index) + ".npy", false, 2, ds_shape, dataset);
     }
     std::cout << std::endl;
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
@@ -464,5 +496,15 @@ int main(){
 
     // free memory
     cudaFree(devStates);
+    cudaFree(d_accuracy_bins);
+    cudaFree(d_bin_slack);
+    cudaFree(d_robot);
+    cudaFree(d_poses);
+    cudaFree(d_std_devs);
+    cudaFree(d_positions);
+    cudaFree(d_pose_idxs);
+    cudaFree(d_var_idxs);
+    cudaFree(d_cp);
+    cudaFree(d_done);
     std::cout << "Done." << std::endl;
 }
