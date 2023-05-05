@@ -26,17 +26,17 @@
  as well as a random pose and variance from the pregenerated poses and variances. 
  */
 
-#define N 1000 // numer of monte carlo smaples per iteration
-#define MAX_RESAMPLE 100
+#define N 4000 // numer of monte carlo smaples per iteration
+#define MAX_RESAMPLE 1000
 #define R_WIDTH 4.07 // width of the robot
 #define R_HEIGHT 1.74 // height of the robot
 
-#define NUM_BATCH 20 //16777216 // number of configurations that are generated per batch
-#define NUM_BATCHES 1 // number of batches 
+#define NUM_BATCH 16777216 // number of configurations that are generated per batch
+#define NUM_BATCHES 100 // number of batches 
 #define NUM_DATA_POINTS double(NUM_BATCH)*NUM_BATCHES
 
 #define NUM_POSES 64*64*64 // number of poses that are sampled, a pose contains the width, height of the obstacle and angle theta of the robot
-#define NUM_VARIANCES 64*64*64 // number of variances that are sampled, 
+#define NUM_VARIANCES 64*64*64*4 // number of variances that are sampled, 
 
 #define POS_MIN -6.0 // minimium x-, y-position of the robot
 #define POS_MAX 6.0 // maximum x-, y-position of the robot
@@ -44,8 +44,10 @@
 #define OBSTACLE_WIDTH_MIN 0.1 // minimum width, height of obstacles
 #define OBSTACLE_WIDTH_MAX 5.0 // maximum width, height of obstacles
 
-#define VAR_MIN 0.00001 // minimum positional and rotational variance 
+#define VAR_MIN 0.001 // minimum positional and rotational variance 
 #define VAR_MAX 0.3 // maximum positional and rotational variance 
+
+#define N_ACCURACY_BINS 3
 
 #define THREADS 1024
 #define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
@@ -70,6 +72,7 @@ struct Pose
 {
     float width, height, theta;
 };
+
 
 typedef Variance StdDev;
 typedef thrust::device_vector<Position>::iterator   DeviceFloatPairIterator;
@@ -98,19 +101,6 @@ void write_config(){
     confFile.close();
 
 }
-
-struct invert_functor
-{
-  __host__ __device__
-  void operator()(int& x)
-  {
-    // note that using printf in a __device__ function requires
-    // code compiled for a GPU with compute capability 2.0 or
-    // higher (nvcc --arch=sm_20)
-    x = 1 - x;
-  }
-};
-
 __global__ void setup_kernel(curandState *state)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -190,7 +180,7 @@ __device__
 float calcSlack(int nsamples, int nsamples_true){
     float z = 1.96;
     float alpha = 0.025;
-    if(nsamples_true == nsamples){
+    if((nsamples_true == nsamples) || (nsamples_true == 0)){
         return log(1.0 / alpha) / nsamples;
     }
     else{
@@ -221,15 +211,17 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
     int pose_idx;
     int std_dev_idx;
     Position pos;
-    int total_collisions = 0;
+    int n_samplestrue = 0;
     float cp_out;
     if(iteration == 0){
-        pos.x = curand_normal(localState) * 3.9/1.96;
-        pos.y = curand_normal(localState) * 3.9/1.96;
+        // pos.x = curand_normal(localState) * 3.9/1.96;
+        // pos.y = curand_normal(localState) * 3.9/1.96;
+        pos.x = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
+        pos.y = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
         pose_idx = curand(localState) % NUM_POSES;
         std_dev_idx = curand(localState) % NUM_VARIANCES;
     } else {
-        total_collisions = (int) cps[gidx];
+        n_samplestrue = (int) cps[gidx];
         pos = positions[gidx];
         pose_idx = pose_idxs[gidx];
         std_dev_idx = std_dev_idxs[gidx];
@@ -249,25 +241,27 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
     for (int i = 0; i < N; i++)
     {
         sample_rectangle(obstacle, sampled_obstacle, std_dev, localState);
-        total_collisions += convex_collide(robot, sampled_obstacle);
+        n_samplestrue += convex_collide(robot, sampled_obstacle);
     }
+    int n_samples = N * (iteration+1);
+    float slack = calcSlack(n_samples, n_samplestrue);
 
-    float slack = calcSlack(N, total_collisions);
-
-    float p = (float) total_collisions / (float) (N * (iteration+1));
+    float p = (float) n_samplestrue / (float) n_samples;
     int d = 0;
     if(iteration+1 == MAX_RESAMPLE){
+        printf("n_samplestrue %i, n_samples %i, %f\n", n_samplestrue, n_samples, slack);
         d = 1;
     }
     else {
-        for (int i = 0; i < 3; i++){
-            if(p >= accuracy_bins[i] && p < accuracy_bins[i+1] && slack < bin_slack[i]){
+        for (int i = 0; i < N_ACCURACY_BINS; i++){
+            // a bit hacky, but actually results in accuracy_bins[i] <=  p < accuracy_bins[i+1] (which is what we want)
+            if(p >= accuracy_bins[i] && p <= accuracy_bins[i+1] && slack < bin_slack[i]){
                 d = 1;
             }
         }
     }
 
-    cp_out = total_collisions;
+    cp_out = n_samplestrue;
     if(d){
         cp_out = p;
     }
@@ -463,6 +457,7 @@ int main(){
                 cudaMemcpy(pose_idxs + num_left, d_pose_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
             }
             iteration++;
+            printf("num left %i\n", num_left);
         }
 
         if(num_left > 0){
@@ -477,6 +472,7 @@ int main(){
         CUDA_CALL(cudaDeviceSynchronize());
         printf("\33[2K\r");
         printf("batches generated: %i/%i", ++counter, NUM_BATCHES);
+        printf("num left %i", num_left);
         fflush(stdout); 
 
         // write data
