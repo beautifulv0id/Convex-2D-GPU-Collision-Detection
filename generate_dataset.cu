@@ -26,8 +26,9 @@
  as well as a random pose and variance from the pregenerated poses and variances. 
  */
 
-#define N 4000 // numer of monte carlo smaples per iteration
-#define MAX_RESAMPLE 1000
+#define UNIFORM_SAMPLING 0
+
+#define N 4000000
 #define R_WIDTH 4.07 // width of the robot
 #define R_HEIGHT 1.74 // height of the robot
 
@@ -47,12 +48,14 @@
 #define VAR_MIN 0.001 // minimum positional and rotational variance 
 #define VAR_MAX 0.3 // maximum positional and rotational variance 
 
-#define N_ACCURACY_BINS 3
+#define N_ACCURACY_BINS 4
 
 #define THREADS 1024
 #define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
 
-#define DATA_DIR "data"
+float accuracy_bins[N_ACCURACY_BINS+1] = {0, 0.001, 0.01, 0.1, 1};
+float bin_slack[N_ACCURACY_BINS+1] = {0.00005,0.0005, 0.001, 0.01, 0};
+
 
 #define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
     printf("Error at %s:%d\n",__FILE__,__LINE__); \
@@ -81,9 +84,10 @@ typedef thrust::device_vector<int>::iterator   DeviceIntIterator;
 typedef thrust::tuple<DeviceFloatPairIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceFloatIterator> DeviceIteratorTuple;
 typedef thrust::zip_iterator<DeviceIteratorTuple> DeviceZipIterator;
 
-void write_config(){
+void write_config(std::string data_dir){
     std::ofstream confFile;
-    confFile.open (DATA_DIR + std::string("/config.txt"), std::ios::out);
+    confFile.open (data_dir + std::string("/config.txt"), std::ios::out);
+    confFile << "UNIFORM_SAMPLING" << "\t" << UNIFORM_SAMPLING << "\n";
     confFile << "N" << "\t" << N << "\n";
     confFile << "R_WIDTH" << "\t" << R_WIDTH << "\n";
     confFile << "R_HEIGHT" << "\t" << R_HEIGHT << "\n";
@@ -98,15 +102,24 @@ void write_config(){
     confFile << "OBSTACLE_WIDTH_MAX" << "\t" << OBSTACLE_WIDTH_MAX << "\n";
     confFile << "VAR_MIN" << "\t" << VAR_MIN << "\n";
     confFile << "VAR_MAX" << "\t" << VAR_MAX << "\n";
+    confFile << "ACCURACY_BINS" << "\t";
+    for (size_t i = 0; i < N_ACCURACY_BINS+1; i++)
+        confFile << accuracy_bins[i] << " ";
+    confFile << "\n";
+    confFile << "BIN_SLACK" << "\t";
+    for (size_t i = 0; i < N_ACCURACY_BINS; i++)
+        confFile << bin_slack[i] << " ";
+    confFile << "\n";
+    
     confFile.close();
 
 }
-__global__ void setup_kernel(curandState *state)
+__global__ void setup_kernel(curandState *state, int seed)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
     /* Each thread gets different seed, a different sequence
        number, no offset */
-    curand_init(7+id, id, 0, &state[id]);
+    curand_init(seed+id, id, 0, &state[id]);
 }
 
 __device__ __host__
@@ -188,6 +201,13 @@ float calcSlack(int nsamples, int nsamples_true){
     }
 }
 
+__global__ void write_collision_probability(float* n_true, int n_done, int n_samples){
+    int gidx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(gidx >= n_done)
+        return;
+    n_true[gidx] =  n_true[gidx] / (float) n_samples;
+}
+
 
 __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
                                                                 Pose* poses,
@@ -200,6 +220,8 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
                                                                 float* bin_slack,
                                                                 int* done,
                                                                 int iteration,
+                                                                int n_samples,
+                                                                int n_batch,
                                                                 int num_left,
                                                                 curandState* state) {
     int gidx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -212,13 +234,14 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
     int std_dev_idx;
     Position pos;
     int n_samplestrue = 0;
-    float cp_out;
     if(iteration == 0){
-        // pos.x = curand_normal(localState) * 3.9/1.96;
-        // pos.y = curand_normal(localState) * 3.9/1.96;
-        pos.x = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
-        pos.y = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
-        pose_idx = curand(localState) % NUM_POSES;
+        if(UNIFORM_SAMPLING == 1){
+            pos.x = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
+            pos.y = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
+        } else {
+            pos.x = curand_normal(localState) * 10/1.96;
+            pos.y = curand_normal(localState) * 10/1.96;
+        }        pose_idx = curand(localState) % NUM_POSES;
         std_dev_idx = curand(localState) % NUM_VARIANCES;
     } else {
         n_samplestrue = (int) cps[gidx];
@@ -238,59 +261,41 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
     memcpy(robot, robot_base, sizeof(float) * 8);
     rot_trans_rectangle(robot, pos.x, pos.y, pose.theta);
 
-    for (int i = 0; i < N; i++)
+    for (int i = 0; i < n_batch; i++)
     {
         sample_rectangle(obstacle, sampled_obstacle, std_dev, localState);
         n_samplestrue += convex_collide(robot, sampled_obstacle);
     }
-    int n_samples = N * (iteration+1);
+    // int n_samples = N * (iteration+1);
     float slack = calcSlack(n_samples, n_samplestrue);
 
     float p = (float) n_samplestrue / (float) n_samples;
     int d = 0;
-    if(iteration+1 == MAX_RESAMPLE){
-        printf("n_samplestrue %i, n_samples %i, %f\n", n_samplestrue, n_samples, slack);
-        d = 1;
-    }
-    else {
-        for (int i = 0; i < N_ACCURACY_BINS; i++){
-            // a bit hacky, but actually results in accuracy_bins[i] <=  p < accuracy_bins[i+1] (which is what we want)
-            if(p >= accuracy_bins[i] && p <= accuracy_bins[i+1] && slack < bin_slack[i]){
-                d = 1;
-            }
+    for (int i = 0; i < N_ACCURACY_BINS; i++){
+        // a bit hacky, but actually results in accuracy_bins[i] <=  p < accuracy_bins[i+1] (which is what we want)
+        if(p >= accuracy_bins[i] && p <= accuracy_bins[i+1] && slack <= bin_slack[i]){
+            d = 1;
         }
     }
 
-    cp_out = n_samplestrue;
-    if(d){
-        cp_out = p;
-    }
-
     done[gidx] = d;
-    cps[gidx] = cp_out;
+    cps[gidx] = n_samplestrue;
     positions[gidx] = pos;
     pose_idxs[gidx] = pose_idx;
     std_dev_idxs[gidx] = std_dev_idx;
 }
 
-void print_help(int* done, int* d_done, int* index, int* d_index){
-    cudaMemcpy(done, d_done, sizeof(int) * NUM_BATCH, cudaMemcpyDeviceToHost);
-    cudaMemcpy(index, d_index, sizeof(int) * NUM_BATCH, cudaMemcpyDeviceToHost);
-    printf("done:  ");
-    for (size_t i = 0; i < NUM_BATCH; i++)
-    {
-        printf("%2d ", done[i]);
+int main(int argc, char* argv[])
+{   
+    std::string data_dir = "data";
+    int start_batch_count = 0;
+    if(argc > 1){
+        data_dir = std::string(argv[1]);
+        if(argc > 2){
+            start_batch_count = std::stoi(argv[2]);
+        }
     }
-    printf("\n");
-    printf("index: ");
-    for (size_t i = 0; i < NUM_BATCH; i++)
-    {
-        printf("%2d ", index[i]);
-    }
-    printf("\n");
-}
-
-int main(){
+    
     int nDevices;
     cudaGetDeviceCount(&nDevices);
 
@@ -324,7 +329,7 @@ int main(){
 
     }
 
-    write_config();
+    write_config(data_dir);
 
     Pose* poses = (Pose*) malloc(sizeof(Pose)*NUM_POSES);
     StdDev* std_devs = (Variance*) malloc(sizeof(StdDev)*NUM_VARIANCES);  
@@ -359,11 +364,9 @@ int main(){
     // write poses and variances
     size_t poses_shape[2] = {(size_t) NUM_POSES, (size_t) 3};
     size_t variances_shape[2] = {(size_t) NUM_VARIANCES, (size_t) 5};
-    npy::SaveArrayAsNumpy(DATA_DIR + std::string("/poses.npy"), false, 2, poses_shape, (float*) poses);
-    npy::SaveArrayAsNumpy(DATA_DIR + std::string("/variances.npy"), false, 2, variances_shape, (float*) variances.data());
 
-    float accuracy_bins[4] = {0, 0.01, 0.1, 1.};
-    float bin_slack[4] = {0.0001, 0.005, 0.01, 0};
+    npy::SaveArrayAsNumpy(data_dir + std::string("/poses.npy"), false, 2, poses_shape, (float*) poses);
+    npy::SaveArrayAsNumpy(data_dir + std::string("/variances.npy"), false, 2, variances_shape, (float*) variances.data());
 
     float* robot = (float*) malloc(sizeof(float)*4*2);
     Position* positions = (Position*) malloc(sizeof(Position) * NUM_BATCH);
@@ -382,8 +385,8 @@ int main(){
     float* d_cp; 
     int* d_done; 
 
-    cudaMalloc(&d_accuracy_bins, sizeof(float)*(4));
-    cudaMalloc(&d_bin_slack, sizeof(float)*(4));
+    cudaMalloc(&d_accuracy_bins, sizeof(float)*(N_ACCURACY_BINS+1));
+    cudaMalloc(&d_bin_slack, sizeof(float)*(N_ACCURACY_BINS+1));
     cudaMalloc(&d_robot, sizeof(float)*(4*2));
     cudaMalloc(&d_poses, sizeof(Pose)*NUM_POSES);
     cudaMalloc(&d_std_devs, sizeof(StdDev)*NUM_VARIANCES);
@@ -414,9 +417,9 @@ int main(){
     cudaMemcpy(d_robot, robot, sizeof(float)*(4*2), cudaMemcpyHostToDevice);
     cudaMemcpy(d_poses, poses, sizeof(Pose)*NUM_POSES, cudaMemcpyHostToDevice);
     cudaMemcpy(d_std_devs, std_devs, sizeof(Variance)*NUM_VARIANCES, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_accuracy_bins, accuracy_bins, sizeof(float)*(4), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bin_slack, bin_slack, sizeof(float)*(4), cudaMemcpyHostToDevice);
-    setup_kernel<<<BLOCKS, THREADS>>>(devStates);
+    cudaMemcpy(d_accuracy_bins, accuracy_bins, sizeof(float)*(N_ACCURACY_BINS+1), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bin_slack, bin_slack, sizeof(float)*(N_ACCURACY_BINS+1), cudaMemcpyHostToDevice);
+    setup_kernel<<<BLOCKS, THREADS>>>(devStates, std::rand());
     CUDA_CALL(cudaPeekAtLastError());
 
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
@@ -430,8 +433,15 @@ int main(){
         int num_left = NUM_BATCH;
         int batch_done = 0;
         int iteration = 0;
-        while(num_left != 0 && iteration < MAX_RESAMPLE){
+        int n_samples = 0;
+        int n_batch = 0;
+        while(num_left != 0 && n_samples < N){
             numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
+            if(n_samples < 20000)
+                n_batch = 1000;
+            else
+                n_batch = 10000;
+            n_samples += n_batch;
             monte_carlo_sample_collision_dataset_uniform<<<numBlocks, threadsPerBlock>>>(
                 d_robot,
                 d_poses,
@@ -444,6 +454,8 @@ int main(){
                 d_bin_slack,
                 d_done,
                 iteration,
+                n_samples,
+                n_batch,
                 num_left,
                 devStates
             );
@@ -451,17 +463,19 @@ int main(){
             if(batch_done > 0){
                 thrust::sort_by_key(thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), d_iter);
                 num_left -= batch_done;
+                numBlocks = ((int) ceil((float) batch_done/threadsPerBlock.x));  
+                write_collision_probability<<<numBlocks, threadsPerBlock>>>(d_cp + num_left, batch_done, n_samples);
                 cudaMemcpy(positions + num_left, d_positions + num_left, sizeof(Position) * batch_done, cudaMemcpyDeviceToHost);
                 cudaMemcpy(cp + num_left, d_cp + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
                 cudaMemcpy(var_idxs + num_left, d_var_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
                 cudaMemcpy(pose_idxs + num_left, d_pose_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
             }
             iteration++;
-            printf("num left %i\n", num_left);
+            // printf("num left %i, n_samples %i\n", num_left, n_samples);
         }
 
         if(num_left > 0){
-            printf("copying remaining %i over (0, %i)\n", num_left, num_left);
+            // printf("copying remaining %i over (0, %i)\n", num_left, num_left);
             cudaMemcpy(positions, d_positions, sizeof(Position) * num_left, cudaMemcpyDeviceToHost);
             cudaMemcpy(cp, d_cp, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
             cudaMemcpy(var_idxs, d_var_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
@@ -472,7 +486,7 @@ int main(){
         CUDA_CALL(cudaDeviceSynchronize());
         printf("\33[2K\r");
         printf("batches generated: %i/%i", ++counter, NUM_BATCHES);
-        printf("num left %i", num_left);
+        // printf("num left %i", num_left);
         fflush(stdout); 
 
         // write data
@@ -493,7 +507,7 @@ int main(){
         // write dataset
         size_t ds_shape[2] = {(size_t) NUM_BATCH, (size_t) 5};
 
-        npy::SaveArrayAsNumpy(DATA_DIR + std::string("/") + std::to_string(batch_index) + ".npy", false, 2, ds_shape, dataset);
+        npy::SaveArrayAsNumpy(data_dir + std::string("/") + std::to_string(start_batch_count + batch_index) + ".npy", false, 2, ds_shape, dataset);
     }
     std::cout << std::endl;
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
