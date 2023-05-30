@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <npy.hpp>
 #include <random>
 #include <vector>
 
@@ -175,6 +176,7 @@ double pr_ci(std::vector<double> query, double alpha, int n_samples_init,
   int b = 0;
 
   while (true) {
+#pragma omp parallel for reduction(+ : k_total, k_true)
     for (int i = 0; i < (b == 0 ? n_samples_init : n_samples_per_batch); ++i) {
       bool result = sample(query);
       if (result) {
@@ -205,15 +207,21 @@ std::vector<double> computeCollisionProbabilities(
     const std::vector<std::vector<double>> &queries, double alpha,
     int n_samples_init, int n_samples_per_batch, int n_samples_max,
     const std::vector<double> &accuracy_bins,
-    const std::vector<double> &bin_slack) {
+    const std::vector<double> &bin_slack,
+    std::vector<std::chrono::duration<double>> &elapsed_times) {
   std::vector<double> collision_probabilities;
   collision_probabilities.reserve(queries.size());
 
-  #pragma omp parallel for
+  elapsed_times.reserve(queries.size());
+
   for (const auto &q : queries) {
+    auto start_time = std::chrono::high_resolution_clock::now();
     auto p = pr_ci(q, alpha, n_samples_init, n_samples_per_batch, n_samples_max,
                    accuracy_bins, bin_slack);
     collision_probabilities.push_back(p);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed_time = end_time - start_time;
+    elapsed_times.push_back(elapsed_time);
   }
 
   return collision_probabilities;
@@ -243,7 +251,8 @@ void testSAT() {
 int main(int argc, char *argv[]) {
   srand(static_cast<unsigned>(time(0)));
 
-  int num_queries = 100;
+  int num_queries = 200;
+
   double height_r = 0.8;
   double width_r = 0.75;
 
@@ -275,20 +284,40 @@ int main(int argc, char *argv[]) {
   int n_samples_init = 500;
   int n_samples_per_batch = 100;
   std::vector<double> accuracy_bins = {0.0, 0.001, 0.01, 0.01, 1.0};
+  // std::vector<double> accuracy_bins = {0.0, 1.0};
   std::vector<double> bin_slack = {0.00005, 0.0005, 0.001, 0.01};
+  // std::vector<double> bin_slack = {0.0};
 
   std::cout << "Compute collision probabilities" << std::endl;
-  auto start_time = std::chrono::high_resolution_clock::now();
+
+  std::vector<std::chrono::duration<double>> elapsed_times;
+
   std::vector<double> collisionProbabilities = computeCollisionProbabilities(
       queries, alpha, n_samples_init, n_samples_per_batch, n_samples_max,
-      accuracy_bins, bin_slack);
-  auto end_time = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> elapsed_time = end_time - start_time;
+      accuracy_bins, bin_slack, elapsed_times);
 
-  std::cout << "Elapsed time: " << elapsed_time.count() << " seconds"
+  std::chrono::duration<double> sum =
+      std::accumulate(elapsed_times.begin(), elapsed_times.end(),
+                      std::chrono::duration<double>(0));
+
+  std::cout << "Elapsed time: " << sum.count() << " seconds" << std::endl;
+
+  std::cout << "Elapsed time per query: "
+            << sum.count() / collisionProbabilities.size() << " seconds"
             << std::endl;
 
   std::cout << "Collision probabilities:" << std::endl;
+
+  size_t elapsed_times_shape[1] = {(size_t)num_queries};
+  std::vector<double> elapsed_times_seconds;
+  for (const auto &elapsed_time : elapsed_times) {
+    elapsed_times_seconds.push_back(elapsed_time.count());
+  }
+
+  std::string data_dir = "stats/ztest/speed/";
+  npy::SaveArrayAsNumpy(data_dir + std::string("cpu.npy"), false, 1, elapsed_times_shape, elapsed_times_seconds);
+
+  std::cout << "Saved elapsed times to " << data_dir << std::endl;
 
   double p_mean = 0;
   for (int i = 0; i < collisionProbabilities.size(); i++) {
