@@ -29,32 +29,51 @@
 #define UNIFORM_SAMPLING 0
 
 #define N 4000000
-#define R_WIDTH 4.07 // width of the robot
-#define R_HEIGHT 1.74 // height of the robot
+
+// SIMULATION
+// #define R_WIDTH 4.07 // width of the robot
+// #define R_HEIGHT 1.74 // height of the robot
+
+// TIAGO
+#define R_WIDTH 0.75 // width of the robot
+#define R_HEIGHT 0.8 // height of the robot
+
+
+#define R_OFFSET ((R_WIDTH + R_HEIGHT) / 4)
 
 #define NUM_BATCH 16777216 // number of configurations that are generated per batch
-#define NUM_BATCHES 100 // number of batches 
+#define NUM_BATCHES 200 // number of batches 
 #define NUM_DATA_POINTS double(NUM_BATCH)*NUM_BATCHES
 
 #define NUM_POSES 64*64*64 // number of poses that are sampled, a pose contains the width, height of the obstacle and angle theta of the robot
 #define NUM_VARIANCES 64*64*64*4 // number of variances that are sampled, 
 
-#define POS_MIN -6.0 // minimium x-, y-position of the robot
-#define POS_MAX 6.0 // maximum x-, y-position of the robot
+#define POS_MIN -12.0 // minimium x-, y-position of the robot
+#define POS_MAX 12.0 // maximum x-, y-position of the robot
 
 #define OBSTACLE_WIDTH_MIN 0.1 // minimum width, height of obstacles
 #define OBSTACLE_WIDTH_MAX 5.0 // maximum width, height of obstacles
 
-#define VAR_MIN 0.001 // minimum positional and rotational variance 
+#define VAR_MIN 0.0 // minimum positional and rotational variance 
 #define VAR_MAX 0.3 // maximum positional and rotational variance 
 
 #define N_ACCURACY_BINS 4
 
-#define THREADS 1024
+#define THREADS 512
 #define BLOCKS (int) ceil(NUM_BATCH/(float) THREADS)
 
 float accuracy_bins[N_ACCURACY_BINS+1] = {0, 0.001, 0.01, 0.1, 1};
 float bin_slack[N_ACCURACY_BINS+1] = {0.00005,0.0005, 0.001, 0.01, 0};
+
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 
 #define CUDA_CALL(x) do { if((x) != cudaSuccess) { \
@@ -234,24 +253,30 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
     int std_dev_idx;
     Position pos;
     int n_samplestrue = 0;
+    Pose pose;
+    StdDev std_dev;
     if(iteration == 0){
+        pose_idx = curand(localState) % NUM_POSES;
+        std_dev_idx = curand(localState) % NUM_VARIANCES;
+        pose = poses[pose_idx];
+        std_dev = std_devs[std_dev_idx];
         if(UNIFORM_SAMPLING == 1){
             pos.x = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
             pos.y = POS_MIN + curand_uniform(localState) * (POS_MAX-POS_MIN);
         } else {
-            pos.x = curand_normal(localState) * 10/1.96;
-            pos.y = curand_normal(localState) * 10/1.96;
-        }        pose_idx = curand(localState) % NUM_POSES;
-        std_dev_idx = curand(localState) % NUM_VARIANCES;
+            float theta = curand_uniform(localState) * 2 * M_PI;
+            pos.x = cosf(theta) * (pose.width/2+R_OFFSET+1.7) + curand_normal(localState) * ((std_dev.x+std_dev.width/2)/4);
+            pos.y = sinf(theta) * (pose.height/2+R_OFFSET+1.7) + curand_normal(localState) * ((std_dev.y+std_dev.height/2)/4);
+        }        
     } else {
         n_samplestrue = (int) cps[gidx];
         pos = positions[gidx];
         pose_idx = pose_idxs[gidx];
         std_dev_idx = std_dev_idxs[gidx];
+        pose = poses[pose_idx];
+        std_dev = std_devs[std_dev_idx];
     }
 
-    Pose pose = poses[pose_idx];
-    StdDev std_dev = std_devs[std_dev_idx];
 
     float obstacle[8];
     create_rect(obstacle, pose.width, pose.height);    
@@ -407,7 +432,7 @@ int main(int argc, char* argv[])
     curandState *devStates;
     cudaMalloc((void **)&devStates, NUM_BATCH *  sizeof(curandState));
 
-    dim3 threadsPerBlock(1024);
+    dim3 threadsPerBlock(THREADS);
     dim3 numBlocks((int) ceil(NUM_BATCH/threadsPerBlock.x));  
 
     // Initialize array
@@ -459,6 +484,7 @@ int main(int argc, char* argv[])
                 num_left,
                 devStates
             );
+            gpuErrchk( cudaPeekAtLastError() );
             batch_done = thrust::count(thrust::device, thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), 1);
             if(batch_done > 0){
                 thrust::sort_by_key(thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), d_iter);
