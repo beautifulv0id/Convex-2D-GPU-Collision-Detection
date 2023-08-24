@@ -418,11 +418,14 @@ int main(int argc, char* argv[])
         cudaMemcpy(var_idxs, d_var_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
         cudaMemcpy(pose_idxs, d_pose_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost); 
     }
+
     CUDA_CALL(cudaDeviceSynchronize());
+    cudaMemcpy(indices, d_indices, sizeof(int)*num_data_points, cudaMemcpyDeviceToHost);
+    cudaMemcpy(positions, d_positions, sizeof(Position) * num_data_points, cudaMemcpyDeviceToHost);
 
     std::vector<float> cp_sorted(num_data_points);    
     for(int i = 0; i < num_data_points; i++){
-        cp_sorted[i] = cp[(int) pose_idxs[i]];
+        cp_sorted[indices[i]] = cp[i];
     }
 
     // write dataset
