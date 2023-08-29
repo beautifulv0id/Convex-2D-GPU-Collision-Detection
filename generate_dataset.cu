@@ -49,7 +49,7 @@ struct Arguments {
     std::vector<float> max_variance = {0.3, 0.3, 0.3, 0.3, 0.3};
     std::vector<float> min_pose = {0.1, 0.1, 0.0};
     std::vector<float> max_pose = {5, 5, 2*M_PI};
-    std::vector<float> accuracy_bins = {0.0, 0.001, 0.1, 1.0};
+    std::vector<float> accuracy_bins = {0.0, 0.01, 0.1, 1.0};
     std::vector<float> bin_accuracy = {0.0001, 0.001, 0.01};
     float robot_width = 4.07;
     float robot_height = 1.74;
