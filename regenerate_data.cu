@@ -25,49 +25,57 @@
 #include <cstddef>
 
 #include <algorithm>    
+#include "utils.h"
+#include <boost/program_options.hpp>
+namespace po = boost::program_options;
 
- /*
- This file creates a dataset of collision probabilities between a robot and an obstacle modeled as rectangles for different configurations using Monte Carlo sampling.
- One data-point defines the width, height and variance of the obstacle, as well as the position and orientation of the robot w.r.t the obstacle coordinate frame.
- First, NUM_POSES poses and NUM_VARIANCES variances are unifomely sampled from user-defined bounds. A pose contains the width and height of the obstacle and angle 
- theta of the robot. Variances are defined for the position and orientation of the obstacle. Finally, for each data-point a robot position is uniformly sampled, 
- as well as a random pose and variance from the pregenerated poses and variances. 
- */
+struct Arguments {
+    std::string data_in = "./data_in/";
+    std::string data_out = "./data_out/";
+    int max_samples = 4000000;
+    float robot_width = 4.07;
+    float robot_height = 1.74;
+};
 
-#define UNIFORM_SAMPLING 0
+Arguments parse_args(int argc, char** argv) {
+    Arguments a;
+    po::options_description desc("Allowed options");
+    desc.add_options()
+        ("help", "produce help message")
+        ("data_in", po::value<std::string>(), "where to read the data")
+        ("data_out", po::value<std::string>(), "where to write the data")
+        ("max_samples", po::value<int>(), "maximum number of samples for z-test")
+        ("robot_width,w", po::value<float>(), "robot width")
+        ("robot_height,h", po::value<float>(), "robot height")
+    ;
 
-#define N 4000000
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    po::notify(vm);    
 
-// SIMULATION
-#define R_WIDTH 4.07 // width of the robot
-#define R_HEIGHT 1.74 // height of the robot
-
-// TIAGO
-// #define R_WIDTH 0.75 // width of the robot
-// #define R_HEIGHT 0.8 // height of the robot
-
-
-#define R_OFFSET ((R_WIDTH + R_HEIGHT) / 4)
-
-#define POS_MIN -12.0 // minimium x-, y-position of the robot
-#define POS_MAX 12.0 // maximum x-, y-position of the robot
-
-#define OBSTACLE_WIDTH_MIN 0.1 // minimum width, height of obstacles
-#define OBSTACLE_WIDTH_MAX 5.0 // maximum width, height of obstacles
-
-#define VAR_MIN 0.0 // minimum positional and rotational variance 
-#define VAR_MAX 0.3 // maximum positional and rotational variance 
-
+    if (vm.count("help")) {
+        std::cout << desc << "\n";
+        exit(1);
+    }
+    if(vm.count("data_in")) {
+        a.data_in = vm["data_in"].as<std::string>();
+    }
+    if(vm.count("data_out")) {
+        a.data_out = vm["data_out"].as<std::string>();
+    }
+    if(vm.count("max_samples")) {
+        a.max_samples = vm["max_samples"].as<int>();
+    }
+    if(vm.count("robot_width")) {
+        a.robot_width = vm["robot_width"].as<float>();
+    }
+    if(vm.count("robot_height")) {
+        a.robot_height = vm["robot_height"].as<float>();
+    }
+    return a;
+}
 
 #define THREADS 512
- 
-// float accuracy_bins[] = {0, 0.001, 0.01, 0.1, 1};
-// float bin_slack[] = {0.00005,0.0005, 0.001, 0.01, 0};
-#define N_ACCURACY_BINS 3
-float accuracy_bins[N_ACCURACY_BINS+1] = {0, 0.01, 0.1, 1};
-float bin_slack[N_ACCURACY_BINS+1] = {0.0001, 0.001, 0.01, 0};
-// float bin_slack[] = {0.00002,0.0001, 0.0005, 0.001, 0};
-
 
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
@@ -108,34 +116,6 @@ typedef thrust::device_vector<int>::iterator   DeviceIntIterator;
 typedef thrust::tuple<DeviceFloatPairIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceFloatIterator> DeviceIteratorTuple;
 typedef thrust::zip_iterator<DeviceIteratorTuple> DeviceZipIterator;
 
-void write_config(std::string data_in, int num_batch, int num_batches){
-    std::ofstream confFile;
-    confFile.open (data_in + std::string("/config.txt"), std::ios::out);
-    confFile << "UNIFORM_SAMPLING" << "\t" << UNIFORM_SAMPLING << "\n";
-    confFile << "N" << "\t" << N << "\n";
-    confFile << "R_WIDTH" << "\t" << R_WIDTH << "\n";
-    confFile << "R_HEIGHT" << "\t" << R_HEIGHT << "\n";
-    confFile << "NUM_BATCH" << "\t" << num_batch << "\n";
-    confFile << "NUM_BATCHES" << "\t" << num_batches << "\n";
-    confFile << "NUM_DATA_POINTS" << "\t" << num_batch * num_batches << "\n";
-    confFile << "POS_MIN" << "\t" << POS_MIN << "\n";
-    confFile << "POS_MAX" << "\t" << POS_MAX << "\n";
-    confFile << "OBSTACLE_WIDTH_MIN" << "\t" << OBSTACLE_WIDTH_MIN << "\n";
-    confFile << "OBSTACLE_WIDTH_MAX" << "\t" << OBSTACLE_WIDTH_MAX << "\n";
-    confFile << "VAR_MIN" << "\t" << VAR_MIN << "\n";
-    confFile << "VAR_MAX" << "\t" << VAR_MAX << "\n";
-    confFile << "ACCURACY_BINS" << "\t";
-    for (size_t i = 0; i < N_ACCURACY_BINS+1; i++)
-        confFile << accuracy_bins[i] << " ";
-    confFile << "\n";
-    confFile << "BIN_SLACK" << "\t";
-    for (size_t i = 0; i < N_ACCURACY_BINS; i++)
-        confFile << bin_slack[i] << " ";
-    confFile << "\n";
-    
-    confFile.close();
-
-}
 __global__ void setup_kernel(curandState *state, int seed)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -224,9 +204,9 @@ float calcSlack(int nsamples, int nsamples_true){
 }
 
 __device__
-int getBin(float p, float* accuracy_bins){
+int getBin(float p, float* accuracy_bins, int n_accuracy_bins){
     int bin = 0;
-    for (int i = 0; i < N_ACCURACY_BINS; i++){
+    for (int i = 0; i < n_accuracy_bins; i++){
         if(p >= accuracy_bins[i] && p <= accuracy_bins[i+1]){
             bin = i;
         }
@@ -251,7 +231,8 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
                                                                 Position* positions,
                                                                 float* cps,
                                                                 float* accuracy_bins,
-                                                                float* bin_slack,
+                                                                float* bin_accuracy,
+                                                                int n_accuracy_bins,
                                                                 int* done,
                                                                 int iteration,
                                                                 int n_samples,
@@ -296,7 +277,7 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
 
     float p = (float) n_samplestrue / (float) n_samples;
     int d = 0;
-    if(slack <= bin_slack[getBin(p, accuracy_bins)]){
+    if(slack <= bin_accuracy[getBin(p, accuracy_bins, n_accuracy_bins)]){
         d = 1;
     }
 
@@ -306,40 +287,35 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
 
 int main(int argc, char* argv[])
 {   
-    std::string data_in = "data_in";
-    std::string data_out = "data_out";
-    int start_batch_count = 0;
-    int num_batches = 100;
-    if(argc > 1){
-        data_in = std::string(argv[1]);
-        if(argc > 2)
-            data_out = std::string(argv[2]);
-        if (argc > 3) 
-            num_batches = std::stoi(argv[3]);
-        if(argc > 4)
-            start_batch_count = std::stoi(argv[4]);
-    }
+    Arguments args = parse_args(argc, argv);
+    std::string data_in = args.data_in;
+    std::string data_out = args.data_out;
+    int start_batch_count = get_num_batches_in_dir(data_out);
+    int num_batches = get_num_batches_in_dir(data_in);
     
-    std::cout << "data dir: " << data_in << std::endl;
-    std::cout << "num batches: " << num_batches << std::endl;
-    std::cout << "start batch count: " << start_batch_count << std::endl;
-
-    std::vector<double> pos_with_idx_Loader;
+    std::vector<float> pos_with_idx_Loader;
     std::vector<float> posesLoader;
     std::vector<float> variancesLoader;
+    std::vector<float> accuracy_bins;
+    std::vector<float> bin_accuracy;
 
     std::vector<npy::ndarray_len_t> poses_shape;
     std::vector<npy::ndarray_len_t> variances_shape;
     std::vector<npy::ndarray_len_t> pos_with_idx_shape;
+    std::vector<npy::ndarray_len_t> accuracy_bins_shape;
+    std::vector<npy::ndarray_len_t> bin_accuracy_shape;
 
-    npy::LoadArrayFromNumpy(data_in + std::string("/poses.npy"), poses_shape, posesLoader);
-    npy::LoadArrayFromNumpy(data_in + std::string("/variances.npy"), variances_shape, variancesLoader);
+    std::cout << "Reading data..." << std::endl;
+
+    npy::LoadArrayFromNumpy(data_out + std::string("/poses.npy"), poses_shape, posesLoader);
+    npy::LoadArrayFromNumpy(data_out + std::string("/variances.npy"), variances_shape, variancesLoader);
     npy::LoadArrayFromNumpy(data_in + std::string("/0.npy"), pos_with_idx_shape, pos_with_idx_Loader);
-
+    npy::LoadArrayFromNumpy(data_out + std::string("/meta") + std::string("/accuracy_bins.npy"), accuracy_bins_shape, accuracy_bins);
+    npy::LoadArrayFromNumpy(data_out + std::string("/meta") + std::string("/bin_accuracy.npy"), bin_accuracy_shape, bin_accuracy);
 
     int num_poses = poses_shape[0];
     int num_variances = variances_shape[0];
-    int num_data_points = pos_with_idx_shape[0] / 4;
+    int num_data_points = pos_with_idx_shape[0];
 
     std::cout << "num poses: " << num_poses << std::endl;
     std::cout << "num variances: " << num_variances << std::endl;
@@ -373,16 +349,11 @@ int main(int argc, char* argv[])
         std_devs[i].height = sqrt(variances[i].height);
     }
 
-    size_t accuracy_bins_shape[1] = {(size_t) (sizeof(accuracy_bins)/sizeof(accuracy_bins[0]))};
-    size_t bin_slack_shape[1] = {(size_t) (sizeof(bin_slack)/sizeof(bin_slack[0]))};
-    npy::SaveArrayAsNumpy(data_out + "/meta" + std::string("/accuracy_bins.npy"), false, 1, accuracy_bins_shape, accuracy_bins);
-    npy::SaveArrayAsNumpy(data_out + "/meta" + std::string("/bin_slack.npy"), false, 1, bin_slack_shape, bin_slack);
-
     float* robot = (float*) malloc(sizeof(float)*4*2);
     float* cp = (float*) malloc(sizeof(float) * num_data_points);
     
     float* d_accuracy_bins;
-    float* d_bin_slack;
+    float* d_bin_accuracy;
     float* d_robot; 
     Pose* d_poses; 
     StdDev* d_std_devs; 
@@ -392,8 +363,8 @@ int main(int argc, char* argv[])
     float* d_cp; 
     int* d_done; 
 
-    cudaMalloc(&d_accuracy_bins, sizeof(float)*(N_ACCURACY_BINS+1));
-    cudaMalloc(&d_bin_slack, sizeof(float)*(N_ACCURACY_BINS+1));
+    cudaMalloc(&d_accuracy_bins, sizeof(float)*(accuracy_bins.size()));
+    cudaMalloc(&d_bin_accuracy, sizeof(float)*(accuracy_bins.size()));
     cudaMalloc(&d_robot, sizeof(float)*(4*2));
     cudaMalloc(&d_poses, sizeof(Pose)*num_poses);
     cudaMalloc(&d_std_devs, sizeof(StdDev)*num_variances);
@@ -418,14 +389,14 @@ int main(int argc, char* argv[])
     dim3 numBlocks((int) std::max(1.0, ceil(num_data_points/threadsPerBlock.x)));  
 
     // Initialize array
-    create_rect(robot, R_WIDTH, R_HEIGHT);
+    create_rect(robot, args.robot_width, args.robot_height);
 
     // Transfer data from host to device memory
     cudaMemcpy(d_robot, robot, sizeof(float)*(4*2), cudaMemcpyHostToDevice);
     cudaMemcpy(d_poses, poses, sizeof(Pose)*num_poses, cudaMemcpyHostToDevice);
     cudaMemcpy(d_std_devs, std_devs, sizeof(Variance)*num_variances, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_accuracy_bins, accuracy_bins, sizeof(float)*(N_ACCURACY_BINS+1), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bin_slack, bin_slack, sizeof(float)*(N_ACCURACY_BINS+1), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_accuracy_bins, accuracy_bins.data(), sizeof(float)*accuracy_bins.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bin_accuracy, bin_accuracy.data(), sizeof(float)*bin_accuracy.size(), cudaMemcpyHostToDevice);
     // std::srand(std::time(0));
 
     setup_kernel<<<numBlocks, THREADS>>>(devStates, std::rand());
@@ -458,7 +429,7 @@ int main(int argc, char* argv[])
         int iteration = 0;
         int n_samples = 0;
         int n_batch = 0;
-        while(num_left > 0 && n_samples < N){
+        while(num_left > 0 && n_samples < args.max_samples){
             numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
             if(n_samples < 20000)
                 n_batch = 1000;
@@ -474,7 +445,8 @@ int main(int argc, char* argv[])
                 d_positions,
                 d_cp,
                 d_accuracy_bins,
-                d_bin_slack,
+                d_bin_accuracy,
+                accuracy_bins.size(),
                 d_done,
                 iteration,
                 n_samples,
@@ -544,7 +516,7 @@ int main(int argc, char* argv[])
     // free memory
     cudaFree(devStates);
     cudaFree(d_accuracy_bins);
-    cudaFree(d_bin_slack);
+    cudaFree(d_bin_accuracy);
     cudaFree(d_robot);
     cudaFree(d_poses);
     cudaFree(d_std_devs);
