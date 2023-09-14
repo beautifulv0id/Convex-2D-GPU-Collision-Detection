@@ -29,6 +29,8 @@
 
 #include <boost/program_options.hpp>
 namespace po = boost::program_options;
+typedef thrust::tuple<DeviceFloatPairIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceIntIterator> DeviceIteratorTuple;
+typedef thrust::zip_iterator<DeviceIteratorTuple> DeviceZipIterator;
 
 struct Arguments {
     std::string data_in = "./data_in/";
