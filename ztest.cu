@@ -29,18 +29,21 @@
 
 #include <boost/program_options.hpp>
 
-typedef thrust::tuple<DeviceFloatPairIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceFloatIterator> DeviceIteratorTuple;
+typedef thrust::tuple<DeviceFloatPairIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceFloatIterator, DeviceIntIterator> DeviceIteratorTuple;
 typedef thrust::zip_iterator<DeviceIteratorTuple> DeviceZipIterator;
 
 namespace po = boost::program_options;
 
 struct Arguments {
-    std::string data_in = "./data_in/";
-    std::string data_out = "./data_out/";
+    std::string data_dir = "./data/";
+    std::string data_file_in = "";
+    std::string data_file_out = "";
     int max_samples = 4000000;
     float robot_width = 4.07;
     float robot_height = 1.74;
     bool shuffle = true;
+    bool cps_only = false;
+    std::string meta_dir = "";
 };
 
 Arguments parse_args(int argc, char** argv) {
@@ -48,13 +51,15 @@ Arguments parse_args(int argc, char** argv) {
     po::options_description desc("Allowed options");
     desc.add_options()
         ("help", "produce help message")
-        ("data_in", po::value<std::string>(), "where to read the data")
-        ("data_out", po::value<std::string>(), "where to write the data")
+        ("data_dir", po::value<std::string>(), "where to read the data")
+        ("data_file_in", po::value<std::string>(), "where to read the data")
+        ("data_file_out", po::value<std::string>(), "where to write the data")
         ("max_samples", po::value<int>(), "maximum number of samples for z-test")
         ("robot_width,w", po::value<float>(), "robot width")
         ("robot_height,h", po::value<float>(), "robot height")
         ("shuffle", po::value<bool>(),"whether or not to shuffle data")
-
+        ("cps_only", po::value<bool>(),"whether or not to only compute collision probabilities")
+        ("meta_dir", po::value<std::string>(), "path to meta folder containing accuracy_bins.npy and bin_accuracy.npy")
     ;
 
     po::variables_map vm;
@@ -65,11 +70,14 @@ Arguments parse_args(int argc, char** argv) {
         std::cout << desc << "\n";
         exit(1);
     }
-    if(vm.count("data_in")) {
-        a.data_in = vm["data_in"].as<std::string>();
+    if(vm.count("data_dir")) {
+        a.data_dir = vm["data_dir"].as<std::string>();
     }
-    if(vm.count("data_out")) {
-        a.data_out = vm["data_out"].as<std::string>();
+    if(vm.count("data_file_in")) {
+        a.data_file_in = vm["data_file_in"].as<std::string>();
+    }
+    if(vm.count("data_file_out")) {
+        a.data_file_out = vm["data_file_out"].as<std::string>();
     }
     if(vm.count("max_samples")) {
         a.max_samples = vm["max_samples"].as<int>();
@@ -82,6 +90,12 @@ Arguments parse_args(int argc, char** argv) {
     }
     if(vm.count("shuffle")) {
         a.shuffle = vm["shuffle"].as<bool>();
+    }
+    if(vm.count("cps_only")) {
+        a.cps_only = vm["cps_only"].as<bool>();
+    }
+    if(vm.count("meta_dir")) {
+        a.meta_dir = vm["meta_dir"].as<std::string>();
     }
     return a;
 }
@@ -154,33 +168,73 @@ __global__ void monte_carlo_sample_collision_dataset_uniform(float* robot_base,
 int main(int argc, char* argv[])
 {   
     Arguments args = parse_args(argc, argv);
-    std::string data_in = args.data_in;
-    std::string data_out = args.data_out;
-    // int start_batch_count = get_num_batches_in_dir(data_out);
-    int start_batch_count = 0;
-    int num_batches = get_num_batches_in_dir(data_in);
+    fs::path data_dir = args.data_dir;
+    fs::path meta_dir = args.meta_dir;
+    fs::path data_file_in = args.data_file_in;
+    fs::path data_file_out = args.data_file_out;
+
+    std::vector<Pose> poses;
+    std::vector<Variance> variances;
+    std::vector<PositionWithVarAndPoseIdx> positionWithVarAndPoseIdx;
+    std::vector<float> accuracy_bins;
+    std::vector<float> bin_accuracy;
+
+    if(!fs::exists(data_dir)){
+        std::cout << "Error: data_dir " << data_dir << " does not exist." << std::endl;
+        exit(1);
+    }
+    if(meta_dir.empty()){
+        fs::create_directory(data_dir / "meta");
+        size_t accuracy_bins_shape[2] = {(size_t) 4};
+        size_t bin_accuracy_shape[2] = {(size_t) 3};
+        accuracy_bins = {0.0, 0.01, 0.1, 1.0};
+        bin_accuracy = {0.0001, 0.001, 0.01};
+        npy::SaveArrayAsNumpy((data_dir / "meta/accuracy_bins.npy").c_str(), false, 1, accuracy_bins_shape, reinterpret_cast<float*>(accuracy_bins.data()));
+        npy::SaveArrayAsNumpy((data_dir / "meta/bin_accuracy.npy").c_str(), false, 1, bin_accuracy_shape, reinterpret_cast<float*>(bin_accuracy.data()));
+    }
+    if(data_file_in.empty()){
+        fs::create_directories(data_dir / "tmp");
+        data_file_in = data_dir / "tmp/0.npy";
+        std::cout << "Using default input file: " << data_file_in << std::endl;
+    }
+    if(data_file_out.empty()){
+        data_file_out = data_dir / "0.npy";
+        std::cout << "Using default output file: " << data_file_out << "" << std::endl;
+    }
+    if(fs::exists(data_file_out)){
+        std::cout << "Warning: " << data_file_out << " already exists, will be overwritten" << std::endl;
+    }
+    if(!fs::exists(data_dir / "poses.npy")){
+        std::cout << "Error: " << data_dir / "poses.npy" << " does not exist." << std::endl;
+        exit(1);
+    }
+    if(!fs::exists(data_dir / "variances.npy")){
+        std::cout << "Error: " << data_dir / "variances.npy" << " does not exist." << std::endl;
+        exit(1);
+    }
 
     std::cout << "Reading data..." << std::endl;
-
-    std::vector<Pose> poses = load_numpy_array<Pose>(data_out + std::string("/poses.npy"));
-    std::vector<Variance> variances = load_numpy_array<Variance>(data_out + std::string("/variances.npy"));
-    std::vector<PositionWithVarAndPoseIdx> positionWithVarAndPoseIdx = load_numpy_array<PositionWithVarAndPoseIdx>(data_in + std::string("/0.npy"));
-    std::vector<float> accuracy_bins = load_numpy_array<float>(data_out + std::string("/meta") + std::string("/accuracy_bins.npy"));
-    std::vector<float> bin_accuracy = load_numpy_array<float>(data_out + std::string("/meta") + std::string("/bin_accuracy.npy"));
-
+    try {
+        poses = load_numpy_array<Pose>((data_dir / "poses.npy").c_str());
+        variances = load_numpy_array<Variance>((data_dir / "variances.npy").c_str());
+        positionWithVarAndPoseIdx = load_numpy_array<PositionWithVarAndPoseIdx>(data_file_in.c_str());
+        accuracy_bins = load_numpy_array<float>((data_dir / "meta/accuracy_bins.npy").c_str());
+        bin_accuracy = load_numpy_array<float>((data_dir / "meta/bin_accuracy.npy").c_str());
+    } catch (const std::exception& e) {
+        std::cout << "Error while reading numpy arrays" << std::endl;
+        std::cout << e.what() << std::endl;
+        exit(1);
+    }
 
     int num_poses = poses.size();
     int num_variances = variances.size();
     int num_data_points = positionWithVarAndPoseIdx.size();
-
     std::vector<Position> positions(num_data_points);
-
 
     std::cout << "num poses: " << num_poses << std::endl;
     std::cout << "num variances: " << num_variances << std::endl;
     std::cout << "num data points: " << num_data_points << std::endl;
     
-    // StdDev* std_devs = (Variance*) malloc(sizeof(StdDev)*num_variances);  
     std::vector<StdDev> std_devs(num_variances);
     std::vector<int> index(num_data_points);
     std::iota(index.begin(), index.end(), 0);
@@ -237,7 +291,7 @@ int main(int argc, char* argv[])
     cudaMalloc((void **)&devStates, num_data_points *  sizeof(curandState));
 
     dim3 threadsPerBlock(THREADS);
-    dim3 numBlocks((int) std::max(1.0, ceil(num_data_points/threadsPerBlock.x)));  
+    dim3 numBlocks((int) ceil( (float) num_data_points/threadsPerBlock.x));  
 
     // Initialize array
     create_rect(robot, args.robot_width, args.robot_height);
@@ -249,81 +303,78 @@ int main(int argc, char* argv[])
     cudaMemcpy(d_accuracy_bins, accuracy_bins.data(), sizeof(float)*accuracy_bins.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_bin_accuracy, bin_accuracy.data(), sizeof(float)*bin_accuracy.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(d_index, index.data(), sizeof(int)*num_data_points, cudaMemcpyHostToDevice);
-    // std::srand(std::time(0));
+    std::srand(std::time(0));
 
     setup_kernel<<<numBlocks, THREADS>>>(devStates, std::rand());
 
     std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
-    std::cout << "Total number of configurations: " << num_data_points * num_batches << std::endl;
+    std::cout << "Total number of configurations: " << num_data_points << std::endl;
     std::cout << "Begin computation..." << std::endl;
-    int counter = 0;
-    printf("batches generated: %i/%i\n", counter, num_batches);
 
-    for (int batch_index = 0; batch_index < num_batches; batch_index++)
+    for (int i = 0; i < num_data_points; i++)
     {
-        std::vector<PositionWithVarAndPoseIdx> pos_with_idx = load_numpy_array<PositionWithVarAndPoseIdx>(data_in + std::string("/") + std::to_string(batch_index) + std::string(".npy"));
-        for (int i = 0; i < num_data_points; i++)
-        {
-            positions[i].x = pos_with_idx[i].x;
-            positions[i].y = pos_with_idx[i].y;
-            var_idxs[i] = pos_with_idx[i].var_idx;
-            pose_idxs[i] = pos_with_idx[i].pose_idx;
-        }
-        std::iota(index.begin(), index.end(), 0);
-        cudaMemcpy(d_index, index.data(), sizeof(int)*num_data_points, cudaMemcpyHostToDevice);
-        // upload positions, pose_idxs, var_idxs
-        cudaMemcpy(d_positions, positions.data(), sizeof(Position) * num_data_points, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_pose_idxs, pose_idxs, sizeof(float) * num_data_points, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_var_idxs, var_idxs, sizeof(float) * num_data_points, cudaMemcpyHostToDevice);
+        positions[i].x = positionWithVarAndPoseIdx[i].x;
+        positions[i].y = positionWithVarAndPoseIdx[i].y;
+        var_idxs[i] = positionWithVarAndPoseIdx[i].var_idx;
+        pose_idxs[i] = positionWithVarAndPoseIdx[i].pose_idx;
+    }
+    std::iota(index.begin(), index.end(), 0);
+    cudaMemcpy(d_index, index.data(), sizeof(int)*num_data_points, cudaMemcpyHostToDevice);
+    // upload positions, pose_idxs, var_idxs
+    cudaMemcpy(d_positions, positions.data(), sizeof(Position) * num_data_points, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_pose_idxs, pose_idxs, sizeof(float) * num_data_points, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_var_idxs, var_idxs, sizeof(float) * num_data_points, cudaMemcpyHostToDevice);
+    gpuErrchk( cudaPeekAtLastError() );
+    int num_left = num_data_points;
+    int batch_done = 0;
+    int iteration = 0;
+    int n_samples = 0;
+    int n_batch = 10000;
+    while(num_left > 0 && n_samples < args.max_samples){
+        numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
+        // if(n_samples < 20000)
+        //     n_batch = 1000;
+        // else
+        //     n_batch = 100000;
+        n_samples += n_batch;
+        monte_carlo_sample_collision_dataset_uniform<<<numBlocks, threadsPerBlock>>>(
+            d_robot,
+            d_poses,
+            d_std_devs,
+            d_pose_idxs,
+            d_var_idxs,
+            d_positions,
+            d_cp,
+            d_accuracy_bins,
+            d_bin_accuracy,
+            accuracy_bins.size(),
+            d_done,
+            iteration,
+            n_samples,
+            n_batch,
+            num_left,
+            devStates
+        );
         gpuErrchk( cudaPeekAtLastError() );
-        int num_left = num_data_points;
-        int batch_done = 0;
-        int iteration = 0;
-        int n_samples = 0;
-        int n_batch = 0;
-        while(num_left > 0 && n_samples < args.max_samples){
-            numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
-            if(n_samples < 20000)
-                n_batch = 1000;
-            else
-                n_batch = 100000;
-            n_samples += n_batch;
-            monte_carlo_sample_collision_dataset_uniform<<<numBlocks, threadsPerBlock>>>(
-                d_robot,
-                d_poses,
-                d_std_devs,
-                d_pose_idxs,
-                d_var_idxs,
-                d_positions,
-                d_cp,
-                d_accuracy_bins,
-                d_bin_accuracy,
-                accuracy_bins.size(),
-                d_done,
-                iteration,
-                n_samples,
-                n_batch,
-                num_left,
-                devStates
-            );
-            gpuErrchk( cudaPeekAtLastError() );
-            batch_done = thrust::count(thrust::device, thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), 1);
-            gpuErrchk( cudaPeekAtLastError() );
-            if(batch_done > 0){
-                thrust::sort_by_key(thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), d_iter);
-                num_left -= batch_done;
-                numBlocks = ((int) ceil((float) batch_done/threadsPerBlock.x));  
-                write_collision_probability<<<numBlocks, threadsPerBlock>>>(d_cp + num_left, batch_done, n_samples);
-                cudaMemcpy(positions.data() + num_left, d_positions + num_left, sizeof(Position) * batch_done, cudaMemcpyDeviceToHost);
-                cudaMemcpy(cp + num_left, d_cp + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
-                cudaMemcpy(var_idxs + num_left, d_var_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
-                cudaMemcpy(pose_idxs + num_left, d_pose_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
-                cudaMemcpy(index.data() + num_left, d_index + num_left, sizeof(int) * batch_done, cudaMemcpyDeviceToHost);
-            }
-            iteration++;
+        batch_done = thrust::count(thrust::device, thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), 1);
+        gpuErrchk( cudaPeekAtLastError() );
+        if(batch_done > 0){
+            thrust::sort_by_key(thrust::device_pointer_cast(d_done), thrust::device_pointer_cast(d_done + num_left), d_iter);
+            num_left -= batch_done;
+            numBlocks = ((int) ceil((float) batch_done/threadsPerBlock.x));  
+            write_collision_probability<<<numBlocks, threadsPerBlock>>>(d_cp + num_left, batch_done, n_samples);
+            cudaMemcpy(positions.data() + num_left, d_positions + num_left, sizeof(Position) * batch_done, cudaMemcpyDeviceToHost);
+            cudaMemcpy(cp + num_left, d_cp + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
+            cudaMemcpy(var_idxs + num_left, d_var_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
+            cudaMemcpy(pose_idxs + num_left, d_pose_idxs + num_left, sizeof(float) * batch_done, cudaMemcpyDeviceToHost);
+            cudaMemcpy(index.data() + num_left, d_index + num_left, sizeof(int) * batch_done, cudaMemcpyDeviceToHost);
         }
+        iteration++;
+    }
 
-        if(num_left > 0){
+
+    std::cout << "Num left: " << num_left << std::endl;
+    if(num_left > 0){
         numBlocks = ((int) ceil((float) num_left/threadsPerBlock.x));  
         write_collision_probability<<<numBlocks, threadsPerBlock>>>(d_cp, num_data_points, n_samples);
         gpuErrchk( cudaPeekAtLastError() );
@@ -332,11 +383,18 @@ int main(int argc, char* argv[])
         cudaMemcpy(var_idxs, d_var_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost);
         cudaMemcpy(pose_idxs, d_pose_idxs, sizeof(float) * num_left, cudaMemcpyDeviceToHost); 
         cudaMemcpy(index.data(), d_index, sizeof(int) * num_left, cudaMemcpyDeviceToHost);
+    }
+
+    CUDA_CALL(cudaDeviceSynchronize());
+
+    std::vector<float> cps(num_data_points);
+    if(args.cps_only){
+        for (int i = 0; i < num_data_points; i++)
+        {
+            cps[index[i]] = cp[i];
         }
-
-        CUDA_CALL(cudaDeviceSynchronize());
-
-        // write data
+    }
+    else{
         for (int j = 0; j < num_data_points; j++)
         {
             dataset[index[j]].x = positions[j].x;
@@ -345,24 +403,28 @@ int main(int argc, char* argv[])
             dataset[index[j]].var_idx = var_idxs[j];
             dataset[index[j]].pose_idx = pose_idxs[j];
         }
-
-        if(args.shuffle)
-        {
-            shuffle(dataset.begin(), dataset.end(), std::default_random_engine(0));
-        }
-
-
-        // write dataset
-        size_t ds_shape[2] = {(size_t) num_data_points, (size_t) 5};
-
-        npy::SaveArrayAsNumpy(data_out + std::string("/") + std::to_string(start_batch_count + batch_index) + ".npy", false, 2, ds_shape, reinterpret_cast<float*>(dataset.data()));
-        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-        printf("\33[2K\r");
-        printf("batches generated: %i/%i, Time: %i [min]", ++counter, num_batches, (int) std::chrono::duration_cast<std::chrono::minutes>(end - begin).count());
-        fflush(stdout); 
     }
-    std::cout << std::endl;
+
+    if(args.shuffle)
+    {
+        if(!args.cps_only)
+            {shuffle(cps.begin(), cps.end(), std::default_random_engine(0));}
+        else
+            {shuffle(dataset.begin(), dataset.end(), std::default_random_engine(0));}
+    }
+
+
+    // write dataset
+    if(args.cps_only) {
+        size_t cps_shape[2] = {(size_t) num_data_points};
+        npy::SaveArrayAsNumpy(data_file_out.c_str(), false, 1, cps_shape, reinterpret_cast<float*>(cps.data()));
+    } else {    
+        size_t ds_shape[2] = {(size_t) num_data_points, (size_t) 5};
+        npy::SaveArrayAsNumpy(data_file_out.c_str(), false, 2, ds_shape, reinterpret_cast<float*>(dataset.data()));
+    }
+
     std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+
     std::cout << "Finished computation" << std::endl;
     std::cout << "Elapsed time: " << std::chrono::duration_cast<std::chrono::minutes>(end - begin).count() << " [min]" << std::endl;
 

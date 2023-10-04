@@ -9,8 +9,29 @@
 #include <curand.h>
 #include <npy.hpp>
 #include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 namespace fs = boost::filesystem;
+
+
+int dirExists(const char *path)
+{
+    struct stat info;
+
+    if(stat( path, &info ) != 0)
+        return 0;
+    else if(info.st_mode & S_IFDIR)
+        return 1;
+    else
+        return 0;
+}
+
+void mkdirs(std::string path){
+    if(!dirExists(path.c_str())){
+        fs::create_directories(path);
+    }
+}
 
 int get_num_batches_in_dir(std::string directoryPath){
     // Specify the file extension pattern
